@@ -2,11 +2,13 @@ package dump
 
 import (
 	"bufio"
-	"errors"
 	"fmt"
 	"io"
 	"regexp"
 	"strconv"
+
+	"github.com/juju/errors"
+	"github.com/siddontang/go-mysql/mysql"
 )
 
 var (
@@ -27,12 +29,12 @@ var valuesExp *regexp.Regexp
 func init() {
 	binlogExp = regexp.MustCompile("^CHANGE MASTER TO MASTER_LOG_FILE='(.+)', MASTER_LOG_POS=(\\d+);")
 	useExp = regexp.MustCompile("^USE `(.+)`;")
-	valuesExp = regexp.MustCompile("^INSERT INTO `(.+)` VALUES \\((.+)\\);$")
+	valuesExp = regexp.MustCompile("^INSERT INTO `(.+?)` VALUES \\((.+)\\);$")
 }
 
 // Parse the dump data with Dumper generate.
 // It can not parse all the data formats with mysqldump outputs
-func Parse(r io.Reader, h ParseHandler) error {
+func Parse(r io.Reader, h ParseHandler, parseBinlogPos bool) error {
 	rb := bufio.NewReaderSize(r, 1024*16)
 
 	var db string
@@ -41,23 +43,23 @@ func Parse(r io.Reader, h ParseHandler) error {
 	for {
 		line, err := rb.ReadString('\n')
 		if err != nil && err != io.EOF {
-			return err
-		} else if err == io.EOF {
+			return errors.Trace(err)
+		} else if mysql.ErrorEqual(err, io.EOF) {
 			break
 		}
 
 		line = line[0 : len(line)-1]
 
-		if !binlogParsed {
+		if parseBinlogPos && !binlogParsed {
 			if m := binlogExp.FindAllStringSubmatch(line, -1); len(m) == 1 {
 				name := m[0][1]
 				pos, err := strconv.ParseUint(m[0][2], 10, 64)
 				if err != nil {
-					return fmt.Errorf("parse binlog %v err, invalid number", line)
+					return errors.Errorf("parse binlog %v err, invalid number", line)
 				}
 
 				if err = h.BinLog(name, pos); err != nil && err != ErrSkip {
-					return err
+					return errors.Trace(err)
 				}
 
 				binlogParsed = true
@@ -73,11 +75,11 @@ func Parse(r io.Reader, h ParseHandler) error {
 
 			values, err := parseValues(m[0][2])
 			if err != nil {
-				return fmt.Errorf("parse values %v err", line)
+				return errors.Errorf("parse values %v err", line)
 			}
 
 			if err = h.Data(db, table, values); err != nil && err != ErrSkip {
-				return err
+				return errors.Trace(err)
 			}
 		}
 	}
@@ -107,10 +109,12 @@ func parseValues(str string) ([]string, error) {
 			// read string until another single quote
 			j := i + 1
 
+			escaped := false
 			for j < len(str) {
 				if str[j] == '\\' {
 					// skip escaped character
 					j += 2
+					escaped = true
 					continue
 				} else if str[j] == '\'' {
 					break
@@ -123,7 +127,11 @@ func parseValues(str string) ([]string, error) {
 				return nil, fmt.Errorf("parse quote values error")
 			}
 
-			values = append(values, str[i:j+1])
+			value := str[i : j+1]
+			if escaped {
+				value = unescapeString(value)
+			}
+			values = append(values, value)
 			// skip ' and ,
 			i = j + 2
 		}
@@ -132,4 +140,49 @@ func parseValues(str string) ([]string, error) {
 	}
 
 	return values, nil
+}
+
+// unescapeString un-escapes the string.
+// mysqldump will escape the string when dumps,
+// Refer http://dev.mysql.com/doc/refman/5.7/en/string-literals.html
+func unescapeString(s string) string {
+	i := 0
+
+	value := make([]byte, 0, len(s))
+	for i < len(s) {
+		if s[i] == '\\' {
+			j := i + 1
+			if j == len(s) {
+				// The last char is \, remove
+				break
+			}
+
+			value = append(value, unescapeChar(s[j]))
+			i += 2
+		} else {
+			value = append(value, s[i])
+			i++
+		}
+	}
+
+	return string(value)
+}
+
+func unescapeChar(ch byte) byte {
+	// \" \' \\ \n \0 \b \Z \r \t ==> escape to one char
+	switch ch {
+	case 'n':
+		ch = '\n'
+	case '0':
+		ch = 0
+	case 'b':
+		ch = 8
+	case 'Z':
+		ch = 26
+	case 'r':
+		ch = '\r'
+	case 't':
+		ch = '\t'
+	}
+	return ch
 }

@@ -10,12 +10,16 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/juju/errors"
 	"github.com/satori/go.uuid"
 	. "github.com/siddontang/go-mysql/mysql"
 )
 
 const (
-	EventHeaderSize = 19
+	EventHeaderSize            = 19
+	SidLength                  = 16
+	LogicalTimestampTypeCode   = 2
+	PartLogicalTimestampLength = 8
 )
 
 type BinlogEvent struct {
@@ -63,7 +67,7 @@ type EventHeader struct {
 
 func (h *EventHeader) Decode(data []byte) error {
 	if len(data) < EventHeaderSize {
-		return fmt.Errorf("header size too short %d, must 19", len(data))
+		return errors.Errorf("header size too short %d, must 19", len(data))
 	}
 
 	pos := 0
@@ -87,7 +91,7 @@ func (h *EventHeader) Decode(data []byte) error {
 	pos += 2
 
 	if h.EventSize < uint32(EventHeaderSize) {
-		return fmt.Errorf("invalid event size %d, must >= 19", h.EventSize)
+		return errors.Errorf("invalid event size %d, must >= 19", h.EventSize)
 	}
 
 	return nil
@@ -165,7 +169,7 @@ func (e *FormatDescriptionEvent) Decode(data []byte) error {
 	pos++
 
 	if e.EventHeaderLength != byte(EventHeaderSize) {
-		return fmt.Errorf("invalid event header length %d, must 19", e.EventHeaderLength)
+		return errors.Errorf("invalid event header length %d, must 19", e.EventHeaderLength)
 	}
 
 	server := string(e.ServerVersion)
@@ -215,6 +219,9 @@ func (e *RotateEvent) Dump(w io.Writer) {
 
 type XIDEvent struct {
 	XID uint64
+
+	// in fact XIDEvent dosen't have the GTIDSet information, just for beneficial to use
+	GSet GTIDSet
 }
 
 func (e *XIDEvent) Decode(data []byte) error {
@@ -224,6 +231,9 @@ func (e *XIDEvent) Decode(data []byte) error {
 
 func (e *XIDEvent) Dump(w io.Writer) {
 	fmt.Fprintf(w, "XID: %d\n", e.XID)
+	if e.GSet != nil {
+		fmt.Fprintf(w, "GTIDSet: %s\n", e.GSet.String())
+	}
 	fmt.Fprintln(w)
 }
 
@@ -234,6 +244,9 @@ type QueryEvent struct {
 	StatusVars    []byte
 	Schema        []byte
 	Query         []byte
+
+	// in fact QueryEvent dosen't have the GTIDSet information, just for beneficial to use
+	GSet GTIDSet
 }
 
 func (e *QueryEvent) Decode(data []byte) error {
@@ -268,27 +281,42 @@ func (e *QueryEvent) Decode(data []byte) error {
 }
 
 func (e *QueryEvent) Dump(w io.Writer) {
-	fmt.Fprintf(w, "Salve proxy ID: %d\n", e.SlaveProxyID)
+	fmt.Fprintf(w, "Slave proxy ID: %d\n", e.SlaveProxyID)
 	fmt.Fprintf(w, "Execution time: %d\n", e.ExecutionTime)
 	fmt.Fprintf(w, "Error code: %d\n", e.ErrorCode)
 	//fmt.Fprintf(w, "Status vars: \n%s", hex.Dump(e.StatusVars))
 	fmt.Fprintf(w, "Schema: %s\n", e.Schema)
 	fmt.Fprintf(w, "Query: %s\n", e.Query)
+	if e.GSet != nil {
+		fmt.Fprintf(w, "GTIDSet: %s\n", e.GSet.String())
+	}
 	fmt.Fprintln(w)
 }
 
 type GTIDEvent struct {
-	CommitFlag uint8
-	SID        []byte
-	GNO        int64
+	CommitFlag     uint8
+	SID            []byte
+	GNO            int64
+	LastCommitted  int64
+	SequenceNumber int64
 }
 
 func (e *GTIDEvent) Decode(data []byte) error {
-	e.CommitFlag = uint8(data[0])
-
-	e.SID = data[1:17]
-
-	e.GNO = int64(binary.LittleEndian.Uint64(data[17:]))
+	pos := 0
+	e.CommitFlag = uint8(data[pos])
+	pos++
+	e.SID = data[pos : pos+SidLength]
+	pos += SidLength
+	e.GNO = int64(binary.LittleEndian.Uint64(data[pos:]))
+	pos += 8
+	if len(data) >= 42 {
+		if uint8(data[pos]) == LogicalTimestampTypeCode {
+			pos++
+			e.LastCommitted = int64(binary.LittleEndian.Uint64(data[pos:]))
+			pos += PartLogicalTimestampLength
+			e.SequenceNumber = int64(binary.LittleEndian.Uint64(data[pos:]))
+		}
+	}
 	return nil
 }
 
@@ -296,6 +324,87 @@ func (e *GTIDEvent) Dump(w io.Writer) {
 	fmt.Fprintf(w, "Commit flag: %d\n", e.CommitFlag)
 	u, _ := uuid.FromBytes(e.SID)
 	fmt.Fprintf(w, "GTID_NEXT: %s:%d\n", u.String(), e.GNO)
+	fmt.Fprintf(w, "LAST_COMMITTED: %d\n", e.LastCommitted)
+	fmt.Fprintf(w, "SEQUENCE_NUMBER: %d\n", e.SequenceNumber)
+	fmt.Fprintln(w)
+}
+
+type BeginLoadQueryEvent struct {
+	FileID    uint32
+	BlockData []byte
+}
+
+func (e *BeginLoadQueryEvent) Decode(data []byte) error {
+	pos := 0
+
+	e.FileID = binary.LittleEndian.Uint32(data[pos:])
+	pos += 4
+
+	e.BlockData = data[pos:]
+
+	return nil
+}
+
+func (e *BeginLoadQueryEvent) Dump(w io.Writer) {
+	fmt.Fprintf(w, "File ID: %d\n", e.FileID)
+	fmt.Fprintf(w, "Block data: %s\n", e.BlockData)
+	fmt.Fprintln(w)
+}
+
+type ExecuteLoadQueryEvent struct {
+	SlaveProxyID     uint32
+	ExecutionTime    uint32
+	SchemaLength     uint8
+	ErrorCode        uint16
+	StatusVars       uint16
+	FileID           uint32
+	StartPos         uint32
+	EndPos           uint32
+	DupHandlingFlags uint8
+}
+
+func (e *ExecuteLoadQueryEvent) Decode(data []byte) error {
+	pos := 0
+
+	e.SlaveProxyID = binary.LittleEndian.Uint32(data[pos:])
+	pos += 4
+
+	e.ExecutionTime = binary.LittleEndian.Uint32(data[pos:])
+	pos += 4
+
+	e.SchemaLength = uint8(data[pos])
+	pos++
+
+	e.ErrorCode = binary.LittleEndian.Uint16(data[pos:])
+	pos += 2
+
+	e.StatusVars = binary.LittleEndian.Uint16(data[pos:])
+	pos += 2
+
+	e.FileID = binary.LittleEndian.Uint32(data[pos:])
+	pos += 4
+
+	e.StartPos = binary.LittleEndian.Uint32(data[pos:])
+	pos += 4
+
+	e.EndPos = binary.LittleEndian.Uint32(data[pos:])
+	pos += 4
+
+	e.DupHandlingFlags = uint8(data[pos])
+
+	return nil
+}
+
+func (e *ExecuteLoadQueryEvent) Dump(w io.Writer) {
+	fmt.Fprintf(w, "Slave proxy ID: %d\n", e.SlaveProxyID)
+	fmt.Fprintf(w, "Execution time: %d\n", e.ExecutionTime)
+	fmt.Fprintf(w, "Schame length: %d\n", e.SchemaLength)
+	fmt.Fprintf(w, "Error code: %d\n", e.ErrorCode)
+	fmt.Fprintf(w, "Status vars length: %d\n", e.StatusVars)
+	fmt.Fprintf(w, "File ID: %d\n", e.FileID)
+	fmt.Fprintf(w, "Start pos: %d\n", e.StartPos)
+	fmt.Fprintf(w, "End pos: %d\n", e.EndPos)
+	fmt.Fprintf(w, "Dup handling flags: %d\n", e.DupHandlingFlags)
 	fmt.Fprintln(w)
 }
 

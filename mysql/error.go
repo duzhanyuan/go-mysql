@@ -1,8 +1,9 @@
 package mysql
 
 import (
-	"errors"
 	"fmt"
+
+	"github.com/juju/errors"
 )
 
 var (
@@ -55,4 +56,11 @@ func NewError(errCode uint16, message string) *MyError {
 	e.Message = message
 
 	return e
+}
+
+func ErrorCode(errMsg string) (code int) {
+	var tmpStr string
+	// golang scanf doesn't support %*,so I used a temporary variable
+	fmt.Sscanf(errMsg, "%s%d", &tmpStr, &code)
+	return
 }
